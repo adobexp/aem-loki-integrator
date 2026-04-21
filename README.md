@@ -1,4 +1,4 @@
-# aem-loki-integrator
+# AEM Integration with Loki Server
 
 AEM bundle and content package that attach a Loki (loki4j) appender to the AEM
 (Sling Commons Log) Logback runtime. Every runtime setting - URL, credentials,
