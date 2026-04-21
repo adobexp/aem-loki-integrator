@@ -4,6 +4,12 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
+    <parent>
+        <groupId>com.adobexp</groupId>
+        <artifactId>central-maven-parent</artifactId>
+        <version>1.0.1</version>
+    </parent>
+
     <groupId>com.adobexp.loki</groupId>
     <artifactId>aem-loki-integrator</artifactId>
     <version>1.0.0-SNAPSHOT</version>
@@ -40,7 +46,21 @@
         <maven.jar.plugin.version>3.3.0</maven.jar.plugin.version>
         <maven.enforcer.plugin.version>3.3.0</maven.enforcer.plugin.version>
         <aemanalyser.version>1.4.10</aemanalyser.version>
+
+        <keyname>33C0330C91FCC3C1</keyname>
+        <server>central</server>
+
+        <!-- Override old plugin versions from central-maven-parent for better Git support -->
+        <maven-release-plugin>3.0.1</maven-release-plugin>
+        <maven-scm-plugin>2.0.1</maven-scm-plugin>
     </properties>
+
+    <scm>
+        <url>https://github.com/adobexp/aem-loki-integrator</url>
+        <connection>scm:git:git@github.com:adobexp/aem-loki-integrator.git</connection>
+        <developerConnection>scm:git:git@github.com:adobexp/aem-loki-integrator.git</developerConnection>
+        <tag>HEAD</tag>
+    </scm>
 
     <build>
         <pluginManagement>
@@ -95,6 +115,40 @@
         </pluginManagement>
 
         <plugins>
+            <!-- Maven Release Plugin - using newer version for better Git support -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-release-plugin</artifactId>
+                <version>${maven-release-plugin}</version>
+                <configuration>
+                <autoVersionSubmodules>true</autoVersionSubmodules>
+                <goals>deploy</goals>
+                <!-- Pass performRelease=true to activate release-specific profiles (e.g., github-release) -->
+                <releaseProfiles>github-release</releaseProfiles>
+                <arguments>-DperformRelease=true</arguments>
+                <!-- Ensure commits are pushed -->
+                <pushChanges>true</pushChanges>
+                <localCheckout>false</localCheckout>
+                <!-- Use the project base directory for SCM operations -->
+                <scmCommentPrefix>[maven-release-plugin] </scmCommentPrefix>
+                <checkModificationExcludes>
+                    <checkModificationExclude>${project.build.directory}</checkModificationExclude>
+                    <checkModificationExclude>**/target</checkModificationExclude>
+                </checkModificationExcludes>
+                </configuration>
+                <dependencies>
+                <dependency>
+                    <groupId>org.apache.maven.scm</groupId>
+                    <artifactId>maven-scm-api</artifactId>
+                    <version>${maven-scm-plugin}</version>
+                </dependency>
+                <dependency>
+                    <groupId>org.apache.maven.scm</groupId>
+                    <artifactId>maven-scm-provider-gitexe</artifactId>
+                    <version>${maven-scm-plugin}</version>
+                </dependency>
+                </dependencies>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-enforcer-plugin</artifactId>
