@@ -1,0 +1,24 @@
+{
+  "url": "https://stloki.sharad.co.uk/loki/api/v1/push",
+  "username": "logger",
+  "password": "vfr4VFR$",
+
+  "labels": [
+    "app=ADOBEXP-AEM",
+    "environment=LOCAL",
+    "tier=Author",
+    "host=${HOSTNAME}",
+    "level=%level"
+  ],
+
+  "batchMaxItems:Integer": 700,
+  "batchTimeoutMs:Integer": 9000,
+  "sendQueueMaxBytes:Long": 0,
+  "verbose:Boolean": false,
+
+  "messagePattern": "*%level* [%thread] %logger{100} | %msg %ex",
+
+  "loggers": [
+    "com.adobexp:DEBUG"
+  ]
+}
