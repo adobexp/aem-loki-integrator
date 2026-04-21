@@ -15,9 +15,12 @@
     <packaging>content-package</packaging>
     <name>AEM Loki Integrator - All</name>
     <description>
-        Content package that installs the core bundle, the loki4j fragment
-        bundle and the default OSGi configuration under
-        /apps/aem-loki-integrator-packages.
+        Content package that installs the core bundle and the loki4j fragment
+        bundle under /apps/aem-loki-integrator-packages/application/install.
+        No default OSGi configuration is shipped; the Loki appender stays
+        unsatisfied until a configuration for
+        com.adobexp.aem.loki.LogbackLokiBootstrap is deployed by the consuming
+        project (see ../example-osgi-config).
     </description>
 
     <dependencies>

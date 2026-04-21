@@ -1,7 +1,7 @@
 {
-  "url": "https://stloki.sharad.co.uk/loki/api/v1/push",
-  "username": "logger",
-  "password": "vfr4VFR$",
+  "url": "https://loki.example.com/loki/api/v1/push",
+  "username": "",
+  "password": "",
 
   "labels": [
     "app=ADOBEXP-AEM",
