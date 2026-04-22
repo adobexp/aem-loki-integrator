@@ -10,7 +10,7 @@
 
     <groupId>com.adobexp.loki</groupId>
     <artifactId>aem-loki-integrator</artifactId>
-    <version>3.0.0</version>
+    <version>3.0.1-SNAPSHOT</version>
     <packaging>pom</packaging>
 
     <name>AEM Loki Integrator - Reactor</name>
@@ -56,7 +56,7 @@
         <url>https://github.com/adobexp/aem-loki-integrator</url>
         <connection>scm:git:git@github.com:adobexp/aem-loki-integrator.git</connection>
         <developerConnection>scm:git:git@github.com:adobexp/aem-loki-integrator.git</developerConnection>
-        <tag>aem-loki-integrator-3.0.0</tag>
+        <tag>HEAD</tag>
     </scm>
 
     <build>
