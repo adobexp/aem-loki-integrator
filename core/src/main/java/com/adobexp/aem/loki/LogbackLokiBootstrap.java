@@ -3,17 +3,24 @@ package com.adobexp.aem.loki;
 import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Dictionary;
+import java.util.Hashtable;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
 import org.apache.sling.commons.log.logback.ConfigProvider;
+import org.osgi.service.cm.Configuration;
+import org.osgi.service.cm.ConfigurationAdmin;
 import org.osgi.service.component.annotations.Activate;
 import org.osgi.service.component.annotations.Component;
 import org.osgi.service.component.annotations.ConfigurationPolicy;
 import org.osgi.service.component.annotations.Deactivate;
 import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.component.annotations.ReferenceCardinality;
+import org.osgi.service.component.annotations.ReferencePolicy;
 import org.osgi.service.metatype.annotations.AttributeDefinition;
 import org.osgi.service.metatype.annotations.AttributeType;
 import org.osgi.service.metatype.annotations.Designate;
@@ -49,10 +56,24 @@ public class LogbackLokiBootstrap implements ConfigProvider {
     private static final String APPENDER_NAME = "LOKI";
     private static final String EMPTY_FRAGMENT = "<included/>";
     private static final String DEFAULT_MESSAGE_PATTERN = "*%level* [%thread] %logger{100} | %msg %ex";
+    private static final String SLING_LOG_MANAGER_PID = "org.apache.sling.commons.log.LogManager";
 
     private static final Logger LOG = LoggerFactory.getLogger(LogbackLokiBootstrap.class);
 
     private volatile String renderedConfig = EMPTY_FRAGMENT;
+
+    /**
+     * ConfigurationAdmin is used on activate/modified to force a Logback
+     * reconfigure. On some Sling Commons Log runtimes (notably the 5.x line
+     * shipped with AEMaaCS) {@code ConfigSourceTracker} does not reliably
+     * schedule a reset/reload when a new {@link ConfigProvider} service is
+     * registered at runtime, so the XML fragment produced here is otherwise
+     * never picked up and the Loki appender never gets instantiated.
+     */
+    @Reference(
+            cardinality = ReferenceCardinality.OPTIONAL,
+            policy = ReferencePolicy.DYNAMIC)
+    private volatile ConfigurationAdmin configAdmin;
 
     @Activate
     @Modified
@@ -62,11 +83,47 @@ public class LogbackLokiBootstrap implements ConfigProvider {
                 config.url(),
                 config.labels().length,
                 config.loggers().length);
+        forceLogbackReload();
     }
 
     @Deactivate
     protected void deactivate() {
         this.renderedConfig = EMPTY_FRAGMENT;
+        forceLogbackReload();
+    }
+
+    /**
+     * Touches the {@code org.apache.sling.commons.log.LogManager} OSGi
+     * configuration with its own current properties. The resulting
+     * {@code ManagedService.updated(...)} call makes Sling Commons Log rebuild
+     * the Logback context, which re-queries every registered
+     * {@link ConfigProvider} - including this one - so our appender XML is
+     * finally merged in.
+     *
+     * <p>The operation is idempotent (the same properties are written back)
+     * and asynchronous (ConfigurationAdmin delivers the update on its own
+     * worker thread), so it does not block activation and never modifies any
+     * real user-visible setting.</p>
+     */
+    private void forceLogbackReload() {
+        final ConfigurationAdmin ca = this.configAdmin;
+        if (ca == null) {
+            LOG.debug("ConfigurationAdmin not available yet; skipping Logback reload trigger");
+            return;
+        }
+        try {
+            final Configuration cfg = ca.getConfiguration(SLING_LOG_MANAGER_PID, null);
+            Dictionary<String, Object> props = cfg.getProperties();
+            if (props == null) {
+                props = new Hashtable<>();
+            }
+            cfg.update(props);
+            LOG.debug("Requested Logback reconfigure via {} to pick up Loki appender fragment",
+                    SLING_LOG_MANAGER_PID);
+        } catch (Exception ex) {
+            LOG.warn("Could not trigger Logback reconfigure via {}: {}",
+                    SLING_LOG_MANAGER_PID, ex.toString());
+        }
     }
 
     @Override
