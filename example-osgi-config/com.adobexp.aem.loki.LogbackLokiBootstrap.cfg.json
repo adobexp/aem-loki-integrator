@@ -18,7 +18,15 @@
 
   "messagePattern": "*%level* [%thread] %logger{100} | %msg %ex",
 
+  "facadeEnabled:Boolean": true,
+  "tailerEnabled:Boolean": false,
+
   "loggers": [
     "com.adobexp:DEBUG"
-  ]
+  ],
+
+  "logFiles": [
+    "error.log"
+  ],
+  "tailIntervalMs:Integer": 500
 }

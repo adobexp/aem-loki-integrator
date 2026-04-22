@@ -5,7 +5,7 @@
     <parent>
         <groupId>com.adobexp.loki</groupId>
         <artifactId>aem-loki-integrator</artifactId>
-        <version>2.0.2-SNAPSHOT</version>
+        <version>3.0.0-SNAPSHOT</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
 
@@ -13,13 +13,18 @@
     <packaging>jar</packaging>
     <name>AEM Loki Integrator - Core Bundle</name>
     <description>
-        OSGi bundle that forwards every AEM/Sling/Felix log event to a Grafana
-        Loki push endpoint. The forwarder subscribes to the standard OSGi Log
-        Reader Service and pushes batched events over java.net.http, so the
-        bundle has zero compile-time or runtime dependency on Logback, SLF4J
-        internals, or any third-party logging library. This keeps AEMaaCS
-        Code Quality rule S1874 green. All runtime settings come from a
-        single OSGi configuration.
+        OSGi bundle that forwards AEM/Sling/Felix log events to a Grafana Loki
+        push endpoint via two independent sources:
+        (1) a drop-in logging facade (com.adobexp.log.Logger /
+        com.adobexp.log.LoggerFactory) that first-party code imports instead
+        of SLF4J; every call is delegated to SLF4J (so Logback keeps writing
+        aemerror.log) and tee'd to Loki with zero file I/O;
+        (2) an opt-in file tailer for capturing third-party bundle logs
+        (com.adobe.*, com.day.*, org.apache.sling.*, ...) that do not use
+        the facade. The bundle has zero compile-time or runtime dependency
+        on Logback, SLF4J internals, or any third-party logging library,
+        which keeps AEMaaCS Code Quality rule S1874 green. All runtime
+        settings come from a single OSGi configuration.
     </description>
 
     <build>
@@ -39,11 +44,15 @@ Bundle-SymbolicName: ${project.artifactId}
 Bundle-Name: ${project.name}
 Bundle-Version: ${project.version}
 
+# Consumer-facing facade API. Application bundles migrating off SLF4J
+# imports will be wired to this package by OSGi at resolve time.
+Export-Package: com.adobexp.log
+
 # Hard veto on any package header AEMaaCS Code Quality rule S1874 would
-# flag as deprecated. The forwarder uses only the SLF4J facade (for its
-# own diagnostics), java.nio.file / java.net.http to tail log files and
-# push them, and the OSGi DS / Metatype annotations for wiring. No OSGi
-# Log Service, no SLF4J SPI, no Logback.
+# flag as deprecated. The bundle uses only the SLF4J facade (public
+# org.slf4j API), java.nio.file / java.net.http to tail and push logs,
+# and the OSGi DS / Metatype annotations for wiring. No OSGi Log
+# Service, no SLF4J SPI/impl/helpers, no Logback.
 Import-Package: !ch.qos.logback.*,\
  !org.apache.sling.commons.log.*,\
  !org.slf4j.spi,\

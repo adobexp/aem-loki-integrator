@@ -48,24 +48,37 @@ import org.slf4j.LoggerFactory;
 /**
  * Forwards AEM / Sling / Felix log events to a Grafana Loki push endpoint.
  *
- * <p>The component tails the on-disk AEM log files produced by Sling
- * Commons Log (by default {@code $SLING_HOME/logs/error.log}), parses each
- * entry with the standard AEM layout (date, time, level, thread, logger,
- * message), batches the events in-memory and pushes them to Loki over
- * {@link HttpClient} with optional gzip compression and Basic auth.
+ * <p>Starting with version 3.x the forwarder has two independent event
+ * sources, both feeding the same batching and HTTP push pipeline:
+ * <ol>
+ *   <li><b>Facade</b> ({@code facadeEnabled}, default {@code true}) -
+ *       consumer bundles call {@link com.adobexp.log.Logger} instead of
+ *       {@link org.slf4j.Logger}. Every call is delegated to SLF4J (so
+ *       Logback keeps writing {@code aemerror.log}) and tee'd to Loki
+ *       with structured args intact. Zero file I/O, no regex parse,
+ *       captures only code that uses the facade.</li>
+ *   <li><b>File tailer</b> ({@code tailerEnabled}, default {@code false}) -
+ *       follows the on-disk AEM log files (by default {@code error.log}
+ *       under {@code $SLING_HOME/logs} or the AEMaaCS equivalent),
+ *       parses each entry with the standard AEM layout, and enqueues it
+ *       on the same push queue. Useful as a fallback to capture
+ *       third-party bundle logs ({@code com.adobe.*}, {@code com.day.*},
+ *       {@code org.apache.sling.*} etc.) that do not call through the
+ *       facade.</li>
+ * </ol>
  *
- * <p>The tailing approach is used deliberately: it captures <b>every</b>
- * log line Logback writes (on AEM classic and AEMaaCS alike) while relying
- * only on {@code java.nio.file}, {@code java.net.http} and
- * {@code org.osgi.service.component}. The bundle therefore has zero
- * compile-time or runtime dependency on Logback, SLF4J internals,
- * {@code org.slf4j.spi}, or any third-party logging library, which keeps
- * AEMaaCS Code Quality rule {@code java:S1874} happy.
+ * <p>The bundle relies only on {@code java.nio.file}, {@code java.net.http}
+ * and the OSGi DS annotations; it has zero compile-time or runtime
+ * dependency on Logback, SLF4J internals, {@code org.slf4j.spi}, or any
+ * third-party logging library, which keeps AEMaaCS Code Quality rule
+ * {@code java:S1874} happy.
  *
- * <p>The class name (and therefore the OSGi PID) is kept unchanged from the
- * 1.x releases so existing
+ * <p>The class name (and therefore the OSGi PID) is kept unchanged from
+ * the 1.x and 2.x releases so existing
  * {@code com.adobexp.aem.loki.LogbackLokiBootstrap.cfg.json}
- * configurations continue to apply without modification.
+ * configurations continue to apply; the new {@code facadeEnabled} and
+ * {@code tailerEnabled} flags are optional and default to sensible
+ * values for a fresh install.
  */
 @Component(
         service = {},
@@ -115,6 +128,7 @@ public class LogbackLokiBootstrap {
     private volatile List<LabelSpec> labelSpecs = Collections.emptyList();
     private volatile List<MessageToken> messageTokens = Collections.emptyList();
     private volatile List<LogFileTailer> tailers = Collections.emptyList();
+    private volatile com.adobexp.log.FacadeSink facadeSink;
 
     private final AtomicLong droppedCount = new AtomicLong();
     private final AtomicLong pushedBatches = new AtomicLong();
@@ -163,45 +177,66 @@ public class LogbackLokiBootstrap {
         final int capacity = Math.max(cfg.batchMaxItems() * 4, MIN_QUEUE_CAPACITY);
         this.queue = new ArrayBlockingQueue<>(capacity);
 
-        final List<Path> resolved = resolveLogFiles(cfg.logFiles());
-        final List<LogFileTailer> ts = new ArrayList<>(resolved.size());
-        final List<Path> existing = new ArrayList<>();
-        final List<Path> missing = new ArrayList<>();
-        for (Path p : resolved) {
-            ts.add(new LogFileTailer(p));
-            if (Files.isRegularFile(p)) {
-                existing.add(p);
-            } else {
-                missing.add(p);
-            }
-        }
-        this.tailers = ts;
-        if (!missing.isEmpty()) {
-            LOG.warn("Loki forwarder: {} configured log file(s) do not exist yet - "
-                            + "the tailer will pick them up once they appear: {}",
-                    missing.size(), missing);
-        }
-        if (existing.isEmpty()) {
-            LOG.warn("Loki forwarder: none of the configured log files exist right now - "
-                    + "check 'logFiles' against the actual AEM log directory.");
-            reportLogDirInventory();
-        } else if (cfg.verbose()) {
-            reportLogDirInventory();
-        }
-
-        this.scheduler = Executors.newScheduledThreadPool(2, new DaemonThreadFactory("aem-loki-forwarder"));
+        final int threadPoolSize = cfg.tailerEnabled() ? 2 : 1;
+        this.scheduler = Executors.newScheduledThreadPool(
+                threadPoolSize, new DaemonThreadFactory("aem-loki-forwarder"));
 
         final long flushMs = Math.max(cfg.batchTimeoutMs(), 250L);
         this.flushTask = this.scheduler.scheduleAtFixedRate(
                 this::flushSafe, flushMs, flushMs, TimeUnit.MILLISECONDS);
 
-        final long tailMs = Math.max(cfg.tailIntervalMs(), 100L);
-        this.tailTask = this.scheduler.scheduleAtFixedRate(
-                this::tailSafe, tailMs, tailMs, TimeUnit.MILLISECONDS);
+        // --------- Tailer (opt-in) ---------------------------------------
+        final List<Path> resolved;
+        final long tailMs;
+        if (cfg.tailerEnabled()) {
+            resolved = resolveLogFiles(cfg.logFiles());
+            final List<LogFileTailer> ts = new ArrayList<>(resolved.size());
+            final List<Path> existing = new ArrayList<>();
+            final List<Path> missing = new ArrayList<>();
+            for (Path p : resolved) {
+                ts.add(new LogFileTailer(p));
+                if (Files.isRegularFile(p)) {
+                    existing.add(p);
+                } else {
+                    missing.add(p);
+                }
+            }
+            this.tailers = ts;
+            if (!missing.isEmpty()) {
+                LOG.warn("Loki forwarder: {} configured log file(s) do not exist yet - "
+                                + "the tailer will pick them up once they appear: {}",
+                        missing.size(), missing);
+            }
+            if (existing.isEmpty()) {
+                LOG.warn("Loki forwarder: none of the configured log files exist right now - "
+                        + "check 'logFiles' against the actual AEM log directory.");
+                reportLogDirInventory();
+            } else if (cfg.verbose()) {
+                reportLogDirInventory();
+            }
+            tailMs = Math.max(cfg.tailIntervalMs(), 100L);
+            this.tailTask = this.scheduler.scheduleAtFixedRate(
+                    this::tailSafe, tailMs, tailMs, TimeUnit.MILLISECONDS);
+        } else {
+            resolved = Collections.emptyList();
+            this.tailers = Collections.emptyList();
+            this.tailTask = null;
+            tailMs = 0L;
+        }
 
-        LOG.info("Loki forwarder started (url={}, logFiles={}, batchMaxItems={}, batchTimeoutMs={}, "
-                        + "tailIntervalMs={}, queueCapacity={}, loggers={}, labels={}, verbose={})",
-                url, resolved, cfg.batchMaxItems(), cfg.batchTimeoutMs(), tailMs, capacity,
+        // --------- Facade sink (opt-out) ---------------------------------
+        if (cfg.facadeEnabled()) {
+            this.facadeSink = new BootstrapFacadeSink();
+            com.adobexp.log.LoggerFactory.setSink(this.facadeSink);
+        } else {
+            this.facadeSink = null;
+        }
+
+        LOG.info("Loki forwarder started (url={}, facadeEnabled={}, tailerEnabled={}, "
+                        + "logFiles={}, batchMaxItems={}, batchTimeoutMs={}, tailIntervalMs={}, "
+                        + "queueCapacity={}, loggers={}, labels={}, verbose={})",
+                url, cfg.facadeEnabled(), cfg.tailerEnabled(), resolved,
+                cfg.batchMaxItems(), cfg.batchTimeoutMs(), tailMs, capacity,
                 this.loggerFilters, this.labelSpecs.size(), cfg.verbose());
     }
 
@@ -211,6 +246,17 @@ public class LogbackLokiBootstrap {
     }
 
     private void shutdown() {
+        // Unregister the facade sink FIRST so no further events can enter
+        // the pipeline while we are draining.
+        final com.adobexp.log.FacadeSink prevSink = this.facadeSink;
+        this.facadeSink = null;
+        if (prevSink != null) {
+            // Only clear the global sink if it still points at us; a
+            // subsequent activation may have already installed its own.
+            if (com.adobexp.log.LoggerFactory.getSink() == prevSink) {
+                com.adobexp.log.LoggerFactory.setSink(null);
+            }
+        }
         final ScheduledFuture<?> flush = this.flushTask;
         this.flushTask = null;
         if (flush != null) {
@@ -225,7 +271,9 @@ public class LogbackLokiBootstrap {
         this.scheduler = null;
         if (exec != null) {
             try {
-                exec.submit(this::tailSafe).get(2, TimeUnit.SECONDS);
+                if (tail != null) {
+                    exec.submit(this::tailSafe).get(2, TimeUnit.SECONDS);
+                }
                 exec.submit(this::flushSafe).get(5, TimeUnit.SECONDS);
             } catch (Exception ignored) {
                 // best-effort drain
@@ -420,10 +468,86 @@ public class LogbackLokiBootstrap {
         }
     }
 
+    // ---------------------------------------------------------- facade sink
+
+    /**
+     * {@link com.adobexp.log.FacadeSink} implementation that routes facade
+     * events into the same batching/push pipeline used by the tailer.
+     * Runs on the caller's thread (the bundle that invoked
+     * {@code LOG.info(...)}), so it must be non-blocking. The heavy
+     * lifting - HTTP push, gzip, JSON assembly - happens asynchronously
+     * on the forwarder's scheduler thread during {@link #flush()}.
+     */
+    private final class BootstrapFacadeSink implements com.adobexp.log.FacadeSink {
+        @Override
+        public void accept(String loggerName, com.adobexp.log.Level level,
+                           String message, Throwable throwable) {
+            if (loggerName == null) {
+                return;
+            }
+            final String threadName = Thread.currentThread().getName();
+            final Level aemLevel = toAemLevel(level);
+            final String finalMessage;
+            if (throwable == null) {
+                finalMessage = message == null ? "" : message;
+            } else {
+                finalMessage = (message == null ? "" : message) + '\n' + stringifyThrowable(throwable);
+            }
+            final ParsedEntry entry = new ParsedEntry(
+                    System.currentTimeMillis(),
+                    aemLevel,
+                    threadName,
+                    loggerName,
+                    finalMessage);
+            ingestLine(entry);
+        }
+    }
+
+    private static Level toAemLevel(com.adobexp.log.Level level) {
+        if (level == null) {
+            return Level.INFO;
+        }
+        switch (level) {
+            case TRACE: return Level.TRACE;
+            case DEBUG: return Level.DEBUG;
+            case INFO:  return Level.INFO;
+            case WARN:  return Level.WARN;
+            case ERROR: return Level.ERROR;
+            default:    return Level.INFO;
+        }
+    }
+
+    private static String stringifyThrowable(Throwable t) {
+        if (t == null) {
+            return "";
+        }
+        final StringBuilder sb = new StringBuilder(256);
+        sb.append(t.getClass().getName());
+        if (t.getMessage() != null) {
+            sb.append(": ").append(t.getMessage());
+        }
+        for (StackTraceElement e : t.getStackTrace()) {
+            sb.append("\n\tat ").append(e);
+        }
+        Throwable cause = t.getCause();
+        while (cause != null && cause != t) {
+            sb.append("\nCaused by: ").append(cause.getClass().getName());
+            if (cause.getMessage() != null) {
+                sb.append(": ").append(cause.getMessage());
+            }
+            for (StackTraceElement e : cause.getStackTrace()) {
+                sb.append("\n\tat ").append(e);
+            }
+            cause = cause.getCause();
+        }
+        return sb.toString();
+    }
+
     /**
      * Accepts a single parsed log entry and, if it matches the configured
      * filters, enqueues it for the next Loki push. Invoked from the tailer
-     * thread.
+     * thread and (via {@link BootstrapFacadeSink}) from application threads
+     * that called the facade.
      */
     private void ingestLine(ParsedEntry entry) {
         final Config cfg = this.config;
@@ -1477,11 +1601,32 @@ public class LogbackLokiBootstrap {
         };
 
         @AttributeDefinition(
+                name = "Facade: enabled",
+                description = "When true (default), classes that use com.adobexp.log.Logger / "
+                        + "com.adobexp.log.LoggerFactory have their events tee'd to Loki in "
+                        + "addition to the normal SLF4J/Logback path. This is the preferred "
+                        + "source for first-party code logs because it ships structured "
+                        + "arguments with zero file I/O.")
+        boolean facadeEnabled() default true;
+
+        @AttributeDefinition(
+                name = "Tailer: enabled",
+                description = "When true, the forwarder also tails the on-disk AEM error.log "
+                        + "and forwards matching lines to Loki. Use this to capture logs from "
+                        + "third-party bundles (com.adobe.*, com.day.*, org.apache.sling.*, "
+                        + "org.apache.jackrabbit.*, io.wcm.* etc.) that do not call through "
+                        + "the facade. Disabled by default; first-party code should rely on "
+                        + "the facade, which is more efficient and works on every AEMaaCS "
+                        + "pod regardless of where logs end up on disk.")
+        boolean tailerEnabled() default false;
+
+        @AttributeDefinition(
                 name = "Log files",
-                description = "On-disk log files to tail. Entries can be absolute paths or paths "
-                        + "relative to $SLING_HOME/logs. Supports ${HOSTNAME} and ${env:NAME;default=X} "
-                        + "substitutions. On AEMaaCS the default 'error.log' resolves to the standard "
-                        + "Sling error log of the running author/publish instance.",
+                description = "On-disk log files to tail. Only used when 'tailerEnabled' is "
+                        + "true. Entries can be absolute paths or paths relative to "
+                        + "$SLING_HOME/logs. Supports ${HOSTNAME} and ${env:NAME;default=X} "
+                        + "substitutions. On AEMaaCS the default 'error.log' resolves to the "
+                        + "standard Sling error log of the running author/publish instance.",
                 cardinality = Integer.MAX_VALUE)
         String[] logFiles() default {"error.log"};
 
