@@ -9,8 +9,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.sling.commons.log.logback.ConfigProvider;
+import org.osgi.framework.BundleContext;
+import org.osgi.framework.ServiceReference;
 import org.osgi.service.cm.Configuration;
 import org.osgi.service.cm.ConfigurationAdmin;
 import org.osgi.service.component.annotations.Activate;
@@ -18,9 +24,6 @@ import org.osgi.service.component.annotations.Component;
 import org.osgi.service.component.annotations.ConfigurationPolicy;
 import org.osgi.service.component.annotations.Deactivate;
 import org.osgi.service.component.annotations.Modified;
-import org.osgi.service.component.annotations.Reference;
-import org.osgi.service.component.annotations.ReferenceCardinality;
-import org.osgi.service.component.annotations.ReferencePolicy;
 import org.osgi.service.metatype.annotations.AttributeDefinition;
 import org.osgi.service.metatype.annotations.AttributeType;
 import org.osgi.service.metatype.annotations.Designate;
@@ -44,6 +47,13 @@ import org.xml.sax.InputSource;
  * <p>By implementing {@link ConfigProvider} the bundle never references any
  * {@code ch.qos.logback.*} internal API, so the AEMaaCS Code Quality rule
  * {@code java:S1874} does not flag it.</p>
+ *
+ * <p>On AEMaaCS the Sling Commons Log {@code ConfigSourceTracker} does not
+ * reliably schedule a Logback reset when a new {@link ConfigProvider} service
+ * is registered at runtime, so this component also forces a reconfigure by
+ * touching the {@code org.apache.sling.commons.log.LogManager} configuration
+ * with a transient delta property. The touch is retried a few times in a
+ * background thread to survive AEMaaCS startup races.</p>
  */
 @Component(
         service = ConfigProvider.class,
@@ -56,73 +66,38 @@ public class LogbackLokiBootstrap implements ConfigProvider {
     private static final String APPENDER_NAME = "LOKI";
     private static final String EMPTY_FRAGMENT = "<included/>";
     private static final String DEFAULT_MESSAGE_PATTERN = "*%level* [%thread] %logger{100} | %msg %ex";
+
     private static final String SLING_LOG_MANAGER_PID = "org.apache.sling.commons.log.LogManager";
+    private static final String RELOAD_TRIGGER_KEY = "_aemLokiReloadTrigger";
+
+    /** Delays (ms) at which the Logback reload is attempted after activation. */
+    private static final long[] RELOAD_DELAYS_MS = {0L, 2_000L, 10_000L, 30_000L, 90_000L};
 
     private static final Logger LOG = LoggerFactory.getLogger(LogbackLokiBootstrap.class);
 
     private volatile String renderedConfig = EMPTY_FRAGMENT;
-
-    /**
-     * ConfigurationAdmin is used on activate/modified to force a Logback
-     * reconfigure. On some Sling Commons Log runtimes (notably the 5.x line
-     * shipped with AEMaaCS) {@code ConfigSourceTracker} does not reliably
-     * schedule a reset/reload when a new {@link ConfigProvider} service is
-     * registered at runtime, so the XML fragment produced here is otherwise
-     * never picked up and the Loki appender never gets instantiated.
-     */
-    @Reference(
-            cardinality = ReferenceCardinality.OPTIONAL,
-            policy = ReferencePolicy.DYNAMIC)
-    private volatile ConfigurationAdmin configAdmin;
+    private volatile BundleContext bundleContext;
+    private volatile ScheduledExecutorService reloadExecutor;
 
     @Activate
     @Modified
-    protected void activate(Config config) {
+    protected void activate(BundleContext ctx, Config config) {
+        this.bundleContext = ctx;
         this.renderedConfig = renderFragment(config);
         LOG.info("LogbackLokiBootstrap ConfigProvider ready (url={}, labels={}, loggers={})",
                 config.url(),
                 config.labels().length,
                 config.loggers().length);
-        forceLogbackReload();
+        scheduleLogbackReload();
     }
 
     @Deactivate
     protected void deactivate() {
         this.renderedConfig = EMPTY_FRAGMENT;
-        forceLogbackReload();
-    }
-
-    /**
-     * Touches the {@code org.apache.sling.commons.log.LogManager} OSGi
-     * configuration with its own current properties. The resulting
-     * {@code ManagedService.updated(...)} call makes Sling Commons Log rebuild
-     * the Logback context, which re-queries every registered
-     * {@link ConfigProvider} - including this one - so our appender XML is
-     * finally merged in.
-     *
-     * <p>The operation is idempotent (the same properties are written back)
-     * and asynchronous (ConfigurationAdmin delivers the update on its own
-     * worker thread), so it does not block activation and never modifies any
-     * real user-visible setting.</p>
-     */
-    private void forceLogbackReload() {
-        final ConfigurationAdmin ca = this.configAdmin;
-        if (ca == null) {
-            LOG.debug("ConfigurationAdmin not available yet; skipping Logback reload trigger");
-            return;
-        }
         try {
-            final Configuration cfg = ca.getConfiguration(SLING_LOG_MANAGER_PID, null);
-            Dictionary<String, Object> props = cfg.getProperties();
-            if (props == null) {
-                props = new Hashtable<>();
-            }
-            cfg.update(props);
-            LOG.debug("Requested Logback reconfigure via {} to pick up Loki appender fragment",
-                    SLING_LOG_MANAGER_PID);
-        } catch (Exception ex) {
-            LOG.warn("Could not trigger Logback reconfigure via {}: {}",
-                    SLING_LOG_MANAGER_PID, ex.toString());
+            scheduleLogbackReload();
+        } finally {
+            shutdownReloadExecutor();
         }
     }
 
@@ -130,6 +105,106 @@ public class LogbackLokiBootstrap implements ConfigProvider {
     public InputSource getConfigSource() {
         return new InputSource(new StringReader(renderedConfig));
     }
+
+    // ------------------------------------------------------------------ reload
+
+    /**
+     * Schedules a chain of Logback reload attempts on a daemon thread. Each
+     * attempt touches the {@code org.apache.sling.commons.log.LogManager}
+     * configuration with a unique timestamp value so that Felix
+     * ConfigurationAdmin is forced to deliver the update to the Sling
+     * {@code LogConfigManager} ManagedService, which in turn calls
+     * {@code LogbackManager.configChanged()} and makes Logback re-query every
+     * registered {@link ConfigProvider}.
+     *
+     * <p>The reload is retried a handful of times with increasing delays so it
+     * still fires if ConfigurationAdmin, the Sling LogConfigManager or our own
+     * component were not yet fully wired at the first attempt.</p>
+     */
+    private void scheduleLogbackReload() {
+        shutdownReloadExecutor();
+        final ScheduledExecutorService exec = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "aem-loki-logback-reload");
+            t.setDaemon(true);
+            return t;
+        });
+        this.reloadExecutor = exec;
+        final AtomicInteger attempt = new AtomicInteger(0);
+        for (long delayMs : RELOAD_DELAYS_MS) {
+            exec.schedule(() -> {
+                int n = attempt.incrementAndGet();
+                boolean ok = triggerLogbackReload(n);
+                if (ok && n >= RELOAD_DELAYS_MS.length) {
+                    shutdownReloadExecutor();
+                }
+            }, delayMs, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void shutdownReloadExecutor() {
+        final ScheduledExecutorService exec = this.reloadExecutor;
+        this.reloadExecutor = null;
+        if (exec != null) {
+            exec.shutdownNow();
+        }
+    }
+
+    private boolean triggerLogbackReload(int attempt) {
+        final BundleContext ctx = this.bundleContext;
+        if (ctx == null) {
+            LOG.debug("Logback reload attempt #{}: bundle context not available", attempt);
+            return false;
+        }
+        ServiceReference<ConfigurationAdmin> ref = null;
+        try {
+            ref = ctx.getServiceReference(ConfigurationAdmin.class);
+            if (ref == null) {
+                LOG.debug("Logback reload attempt #{}: ConfigurationAdmin service not available", attempt);
+                return false;
+            }
+            final ConfigurationAdmin ca = ctx.getService(ref);
+            if (ca == null) {
+                LOG.debug("Logback reload attempt #{}: ConfigurationAdmin lookup returned null", attempt);
+                return false;
+            }
+            final Configuration cfg = ca.getConfiguration(SLING_LOG_MANAGER_PID, null);
+            final Dictionary<String, Object> current = cfg.getProperties();
+            final Dictionary<String, Object> next = copyProperties(current);
+            next.put(RELOAD_TRIGGER_KEY, String.valueOf(System.currentTimeMillis()));
+            cfg.update(next);
+            LOG.info("Triggered Logback reconfigure via {} (attempt #{})",
+                    SLING_LOG_MANAGER_PID, attempt);
+            return true;
+        } catch (Exception ex) {
+            LOG.warn("Logback reload attempt #{} failed: {}", attempt, ex.toString());
+            return false;
+        } finally {
+            if (ref != null) {
+                try {
+                    ctx.ungetService(ref);
+                } catch (IllegalStateException ignored) {
+                    // bundle context might be gone during shutdown
+                }
+            }
+        }
+    }
+
+    private static Dictionary<String, Object> copyProperties(Dictionary<String, Object> src) {
+        final Dictionary<String, Object> out = new Hashtable<>();
+        if (src != null) {
+            final java.util.Enumeration<String> keys = src.keys();
+            while (keys.hasMoreElements()) {
+                final String k = keys.nextElement();
+                final Object v = src.get(k);
+                if (v != null) {
+                    out.put(k, v);
+                }
+            }
+        }
+        return out;
+    }
+
+    // ----------------------------------------------------------------- render
 
     private static String renderFragment(Config config) {
         final String url = trimToEmpty(config.url());
