@@ -15,7 +15,7 @@
     <description>
         Repackages the loki-logback-appender (loki4j) as an OSGi fragment of
         org.apache.sling.commons.log. Attaching it to the Sling log host
-        bundle makes the loki4j classes (and their ch.qos.logback.* references)
+        bundle makes the loki4j classes (and their Logback SPI references)
         visible to the Logback context without the loki4j classes ever being
         loaded by our own customer bundles.
     </description>
@@ -67,15 +67,30 @@ Bundle-SymbolicName: ${project.artifactId}
 Bundle-Name: ${project.name}
 Bundle-Version: ${project.version}
 Fragment-Host: org.apache.sling.commons.log
+
+# As a fragment of org.apache.sling.commons.log we share the host bundle's
+# class loader. The host privately embeds Logback, so the loki4j classes
+# we repackage here can reach ch.qos.logback.* directly through the host -
+# we must NOT advertise those packages in Import-Package, both to keep the
+# bundle wiring consistent and because AEMaaCS Code Quality (rule S1874)
+# treats any ch.qos.logback.* Import-Package header as a vulnerability.
 Export-Package: com.github.loki4j.logback,\
  com.github.loki4j.pkg.*,\
  com.github.loki4j.util.*
-Import-Package: org.xerial.snappy;resolution:=optional,\
+Import-Package: !ch.qos.logback.*,\
+ org.xerial.snappy;resolution:=optional,\
  io.micrometer.core.instrument.*;resolution:=optional,\
  com.google.protobuf;resolution:=optional,\
  com.github.loki4j.pkg.google.protobuf;resolution:=optional,\
  com.github.loki4j.pkg.loki.protobuf;resolution:=optional,\
  *
+
+# Keep the manifest free of 'uses:="ch.qos.logback..."' clauses that bnd
+# would otherwise generate on Export-Package entries. No downstream bundle
+# imports these exports from us (they go through the host), so a uses
+# constraint is not needed and the ch.qos.logback.* tokens trip S1874.
+-nouses: true
+
 Embed-Dependency: loki-logback-appender;scope=compile|runtime
 -includeresource: @loki-logback-appender-${loki4j.version}.jar
 ]]></bnd>
