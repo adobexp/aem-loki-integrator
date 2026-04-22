@@ -1,24 +1,17 @@
 package com.adobexp.aem.loki;
 
-import java.io.StringReader;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Dictionary;
-import java.util.Hashtable;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.sling.commons.log.logback.ConfigProvider;
-import org.osgi.framework.BundleContext;
-import org.osgi.framework.ServiceReference;
-import org.osgi.service.cm.Configuration;
-import org.osgi.service.cm.ConfigurationAdmin;
 import org.osgi.service.component.annotations.Activate;
 import org.osgi.service.component.annotations.Component;
 import org.osgi.service.component.annotations.ConfigurationPolicy;
@@ -28,242 +21,463 @@ import org.osgi.service.metatype.annotations.AttributeDefinition;
 import org.osgi.service.metatype.annotations.AttributeType;
 import org.osgi.service.metatype.annotations.Designate;
 import org.osgi.service.metatype.annotations.ObjectClassDefinition;
+import org.slf4j.ILoggerFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.xml.sax.InputSource;
 
 /**
- * Registers a Logback configuration fragment with the AEM (Sling Commons Log)
- * Logback runtime through the {@link ConfigProvider} extension point. The
- * fragment wires a Loki (loki4j) appender and attaches it to a configurable
- * set of loggers.
+ * Attaches a Loki (loki4j) appender directly to AEM's Logback
+ * {@code LoggerContext} through SLF4J + reflection.
  *
- * <p>Every Loki setting - push URL, credentials, labels, batching, logger
- * names and levels - is taken from the OSGi configuration bound to the
- * {@link Config} OCD. No Logback XML template is shipped with the bundle;
- * the fragment is built from the current configuration on every
- * activate/modify and served through {@link #getConfigSource()}.</p>
- *
- * <p>By implementing {@link ConfigProvider} the bundle never references any
- * {@code ch.qos.logback.*} internal API, so the AEMaaCS Code Quality rule
- * {@code java:S1874} does not flag it.</p>
- *
- * <p>On AEMaaCS the Sling Commons Log {@code ConfigSourceTracker} does not
- * reliably schedule a Logback reset when a new {@link ConfigProvider} service
- * is registered at runtime, so this component also forces a reconfigure by
- * touching the {@code org.apache.sling.commons.log.LogManager} configuration
- * with a transient delta property. The touch is retried a few times in a
- * background thread to survive AEMaaCS startup races.</p>
+ * <p>Design notes - especially for AEMaaCS:
+ * <ul>
+ *   <li>The bundle does not compile against any {@code ch.qos.logback.*}
+ *       class or against the internal
+ *       {@code org.apache.sling.commons.log.logback} API, which keeps
+ *       AEMaaCS Code Quality rule {@code java:S1874} green.</li>
+ *   <li>On activation the component locates the live Logback
+ *       {@code ch.qos.logback.classic.LoggerContext} through
+ *       {@link LoggerFactory#getILoggerFactory()}, creates an instance of
+ *       {@code com.github.loki4j.logback.Loki4jAppender} via the
+ *       LoggerContext's class loader (the Loki4j classes are published by
+ *       the {@code aem-loki-integrator.loki4j} fragment attached to the
+ *       Sling log host), configures it from OSGi properties and attaches
+ *       it to the loggers listed in {@link Config#loggers()}.</li>
+ *   <li>Because Logback may rebuild its context at any time (for example
+ *       when Sling Commons Log re-applies its configuration), a daemon
+ *       watchdog periodically verifies that our appender is still started
+ *       and attached, re-attaching it if necessary. This replaces the
+ *       previous {@code ConfigProvider}/reconfigure dance that did not
+ *       fire reliably on AEMaaCS.</li>
+ * </ul>
  */
 @Component(
-        service = ConfigProvider.class,
+        service = {},
         immediate = true,
         configurationPolicy = ConfigurationPolicy.REQUIRE,
         property = {"process.label=AEM-LOKI | LogbackLokiBootstrap"})
 @Designate(ocd = LogbackLokiBootstrap.Config.class)
-public class LogbackLokiBootstrap implements ConfigProvider {
-
-    private static final String APPENDER_NAME = "LOKI";
-    private static final String EMPTY_FRAGMENT = "<included/>";
-    private static final String DEFAULT_MESSAGE_PATTERN = "*%level* [%thread] %logger{100} | %msg %ex";
-
-    private static final String SLING_LOG_MANAGER_PID = "org.apache.sling.commons.log.LogManager";
-    private static final String RELOAD_TRIGGER_KEY = "_aemLokiReloadTrigger";
-
-    /** Delays (ms) at which the Logback reload is attempted after activation. */
-    private static final long[] RELOAD_DELAYS_MS = {0L, 2_000L, 10_000L, 30_000L, 90_000L};
+public class LogbackLokiBootstrap {
 
     private static final Logger LOG = LoggerFactory.getLogger(LogbackLokiBootstrap.class);
 
-    private volatile String renderedConfig = EMPTY_FRAGMENT;
-    private volatile BundleContext bundleContext;
-    private volatile ScheduledExecutorService reloadExecutor;
+    private static final String APPENDER_NAME = "AEM_LOKI_APPENDER";
+    private static final String DEFAULT_MESSAGE_PATTERN = "*%level* [%thread] %logger{100} | %msg %ex";
+
+    private static final String LOGBACK_LOGGER_CONTEXT_CLASS = "ch.qos.logback.classic.LoggerContext";
+    private static final String LOGBACK_CONTEXT_CLASS = "ch.qos.logback.core.Context";
+    private static final String LOGBACK_APPENDER_IFACE = "ch.qos.logback.core.Appender";
+    private static final String LOGBACK_LEVEL_CLASS = "ch.qos.logback.classic.Level";
+
+    private static final String LOKI_APPENDER_CLASS = "com.github.loki4j.logback.Loki4jAppender";
+    private static final String LOKI_HTTP_SENDER_IFACE = "com.github.loki4j.logback.HttpSender";
+    private static final String LOKI_JAVA_HTTP_SENDER_CLASS = "com.github.loki4j.logback.JavaHttpSender";
+    private static final String LOKI_BASIC_AUTH_CLASS =
+            "com.github.loki4j.logback.AbstractHttpSender$BasicAuth";
+    private static final String LOKI_ENCODER_IFACE = "com.github.loki4j.logback.Loki4jEncoder";
+    private static final String LOKI_JSON_ENCODER_CLASS = "com.github.loki4j.logback.JsonEncoder";
+    private static final String LOKI_LABEL_CFG_CLASS =
+            "com.github.loki4j.logback.AbstractLoki4jEncoder$LabelCfg";
+    private static final String LOKI_MESSAGE_CFG_CLASS =
+            "com.github.loki4j.logback.AbstractLoki4jEncoder$MessageCfg";
+
+    /** How often the watchdog re-checks that our appender is still attached. */
+    private static final long WATCHDOG_INTERVAL_SECONDS = 30L;
+
+    private volatile Config currentConfig;
+    private volatile Object attachedAppender;
+    private volatile ScheduledExecutorService watchdog;
+    private volatile ScheduledFuture<?> watchdogTask;
+    private final Object lock = new Object();
 
     @Activate
     @Modified
-    protected void activate(BundleContext ctx, Config config) {
-        this.bundleContext = ctx;
-        this.renderedConfig = renderFragment(config);
-        LOG.info("LogbackLokiBootstrap ConfigProvider ready (url={}, labels={}, loggers={})",
-                config.url(),
-                config.labels().length,
-                config.loggers().length);
-        scheduleLogbackReload();
+    protected void activate(Config config) {
+        synchronized (lock) {
+            detachInternal();
+            this.currentConfig = config;
+            attachInternal(config);
+            startWatchdog();
+        }
     }
 
     @Deactivate
     protected void deactivate() {
-        this.renderedConfig = EMPTY_FRAGMENT;
-        try {
-            scheduleLogbackReload();
-        } finally {
-            shutdownReloadExecutor();
+        synchronized (lock) {
+            stopWatchdog();
+            detachInternal();
+            this.currentConfig = null;
         }
     }
 
-    @Override
-    public InputSource getConfigSource() {
-        return new InputSource(new StringReader(renderedConfig));
+    // ---------------------------------------------------------------- attach
+
+    private void attachInternal(Config config) {
+        final String url = trimToEmpty(config.url());
+        if (url.isEmpty()) {
+            LOG.warn("Loki push URL is empty; appender will not be attached.");
+            return;
+        }
+
+        final ILoggerFactory factory = LoggerFactory.getILoggerFactory();
+        if (!isLogback(factory)) {
+            LOG.warn("SLF4J ILoggerFactory is '{}', not Logback; Loki appender cannot be attached.",
+                    factory.getClass().getName());
+            return;
+        }
+
+        final ClassLoader cl = factory.getClass().getClassLoader();
+        final Class<?> appenderClass;
+        try {
+            appenderClass = Class.forName(LOKI_APPENDER_CLASS, true, cl);
+        } catch (ClassNotFoundException e) {
+            LOG.error("Loki4jAppender class '{}' is not reachable via Logback's class loader. "
+                            + "The 'aem-loki-integrator.loki4j' fragment is not attached to '"
+                            + "org.apache.sling.commons.log'. Logs will NOT be pushed to Loki.",
+                    LOKI_APPENDER_CLASS);
+            return;
+        }
+
+        final Object appender;
+        try {
+            appender = buildAppender(appenderClass, factory, config, url);
+        } catch (Exception e) {
+            LOG.error("Failed to build Loki4jAppender via reflection", e);
+            return;
+        }
+
+        final List<String> attached = new ArrayList<>();
+        try {
+            attached.addAll(attachToLoggers(factory, appender, config));
+        } catch (Exception e) {
+            LOG.error("Failed to attach Loki4jAppender to Logback loggers", e);
+            stopAppender(appender);
+            return;
+        }
+
+        this.attachedAppender = appender;
+        LOG.info("Loki appender attached via reflection (url={}, labels={}, loggers={}, verbose={})",
+                url,
+                config.labels() == null ? 0 : config.labels().length,
+                attached,
+                config.verbose());
     }
 
-    // ------------------------------------------------------------------ reload
+    private Object buildAppender(Class<?> appenderClass, Object loggerContext, Config config, String url)
+            throws Exception {
+        final ClassLoader cl = loggerContext.getClass().getClassLoader();
+        final Class<?> contextClass = loadClass(cl, LOGBACK_CONTEXT_CLASS);
+        final Object appender = appenderClass.getDeclaredConstructor().newInstance();
+
+        invoke(appender, "setContext", loggerContext, contextClass);
+        invoke(appender, "setName", APPENDER_NAME, String.class);
+
+        invokeSetter(appender, "setBatchMaxItems", config.batchMaxItems(), int.class);
+        invokeSetter(appender, "setBatchTimeoutMs", (long) config.batchTimeoutMs(), long.class);
+        if (config.sendQueueMaxBytes() > 0L) {
+            invokeSetter(appender, "setSendQueueMaxBytes", config.sendQueueMaxBytes(), long.class);
+        }
+        invokeSetter(appender, "setVerbose", config.verbose(), boolean.class);
+
+        configureHttp(appender, cl, url, config);
+        configureFormat(appender, cl, loggerContext, config);
+
+        invoke(appender, "start");
+        return appender;
+    }
 
     /**
-     * Schedules a chain of Logback reload attempts on a daemon thread. Each
-     * attempt touches the {@code org.apache.sling.commons.log.LogManager}
-     * configuration with a unique timestamp value so that Felix
-     * ConfigurationAdmin is forced to deliver the update to the Sling
-     * {@code LogConfigManager} ManagedService, which in turn calls
-     * {@code LogbackManager.configChanged()} and makes Logback re-query every
-     * registered {@link ConfigProvider}.
-     *
-     * <p>The reload is retried a handful of times with increasing delays so it
-     * still fires if ConfigurationAdmin, the Sling LogConfigManager or our own
-     * component were not yet fully wired at the first attempt.</p>
+     * Builds the {@code com.github.loki4j.logback.JavaHttpSender} and wires
+     * it through {@code Loki4jAppender.setHttp(HttpSender)}. JavaHttpSender
+     * is the JDK-based implementation (uses {@code java.net.http.HttpClient})
+     * so it has no third-party runtime dependencies and always resolves on
+     * AEM's JDK 11+.
      */
-    private void scheduleLogbackReload() {
-        shutdownReloadExecutor();
+    private void configureHttp(Object appender, ClassLoader cl, String url, Config config) throws Exception {
+        final Class<?> senderClass = loadClass(cl, LOKI_JAVA_HTTP_SENDER_CLASS);
+        final Class<?> senderIface = loadClass(cl, LOKI_HTTP_SENDER_IFACE);
+
+        final Object sender = senderClass.getDeclaredConstructor().newInstance();
+        invokeSetter(sender, "setUrl", url, String.class);
+
+        final String username = trimToEmpty(config.username());
+        final String password = trimToEmpty(config.password());
+        if (!username.isEmpty() || !password.isEmpty()) {
+            final Class<?> basicAuth = loadClass(cl, LOKI_BASIC_AUTH_CLASS);
+            final Object auth = basicAuth.getDeclaredConstructor().newInstance();
+            invokeSetter(auth, "setUsername", username, String.class);
+            invokeSetter(auth, "setPassword", password, String.class);
+            invokeSetter(sender, "setAuth", auth, basicAuth);
+        }
+
+        // Loki4jAppender#setHttp(HttpSender) expects the interface type.
+        invokeSetter(appender, "setHttp", sender, senderIface);
+    }
+
+    /**
+     * Builds a {@code com.github.loki4j.logback.JsonEncoder} with the
+     * configured label &amp; message patterns and attaches it through
+     * {@code Loki4jAppender.setFormat(Loki4jEncoder)}.
+     */
+    private void configureFormat(Object appender, ClassLoader cl, Object loggerContext, Config config)
+            throws Exception {
+        final Class<?> encoderClass = loadClass(cl, LOKI_JSON_ENCODER_CLASS);
+        final Class<?> encoderIface = loadClass(cl, LOKI_ENCODER_IFACE);
+        final Class<?> labelsClass = loadClass(cl, LOKI_LABEL_CFG_CLASS);
+        final Class<?> messageClass = loadClass(cl, LOKI_MESSAGE_CFG_CLASS);
+        final Class<?> contextClass = loadClass(cl, LOGBACK_CONTEXT_CLASS);
+
+        final String labelPattern = buildLabelPattern(config.labels());
+        final String messagePattern = firstNonBlank(config.messagePattern(), DEFAULT_MESSAGE_PATTERN);
+
+        final Object encoder = encoderClass.getDeclaredConstructor().newInstance();
+        invoke(encoder, "setContext", loggerContext, contextClass);
+
+        final Object label = labelsClass.getDeclaredConstructor().newInstance();
+        invokeSetter(label, "setPattern", labelPattern, String.class);
+        invokeSetter(encoder, "setLabel", label, labelsClass);
+
+        final Object msg = messageClass.getDeclaredConstructor().newInstance();
+        invokeSetter(msg, "setPattern", messagePattern, String.class);
+        invokeSetter(encoder, "setMessage", msg, messageClass);
+
+        invoke(encoder, "start");
+
+        // Loki4jAppender#setFormat(Loki4jEncoder) expects the interface.
+        invokeSetter(appender, "setFormat", encoder, encoderIface);
+    }
+
+    private List<String> attachToLoggers(Object loggerContext, Object appender, Config config)
+            throws Exception {
+        final List<String> names = new ArrayList<>();
+        final List<LoggerEntry> loggers = parseLoggers(config.loggers());
+        if (loggers.isEmpty()) {
+            LOG.warn("No loggers configured; Loki appender is attached but not wired to any logger.");
+            return names;
+        }
+        final ClassLoader cl = loggerContext.getClass().getClassLoader();
+        final Class<?> levelClass = loadClass(cl, LOGBACK_LEVEL_CLASS);
+        final Method toLevel = levelClass.getMethod("toLevel", String.class);
+
+        final Method getLogger = loggerContext.getClass().getMethod("getLogger", String.class);
+        for (LoggerEntry entry : loggers) {
+            final Object logger = getLogger.invoke(loggerContext, entry.name);
+            final Object level = toLevel.invoke(null, entry.level);
+            try {
+                invoke(logger, "setLevel", level, levelClass);
+            } catch (NoSuchMethodException ex) {
+                LOG.debug("Logback logger '{}' has no setLevel(Level) method; skipping level override", entry.name);
+            }
+            try {
+                invokeSetter(logger, "setAdditive", entry.additivity, boolean.class);
+            } catch (NoSuchMethodException ex) {
+                LOG.debug("Logback logger '{}' has no setAdditive(boolean) method; skipping", entry.name);
+            }
+            try {
+                final Class<?> appenderIface = loadClass(cl, LOGBACK_APPENDER_IFACE);
+                final Method addAppender = logger.getClass().getMethod("addAppender", appenderIface);
+                addAppender.invoke(logger, appender);
+            } catch (NoSuchMethodException nsme) {
+                LOG.warn("Logback logger '{}' does not expose addAppender(Appender); cannot attach Loki appender", entry.name);
+                continue;
+            }
+            names.add(entry.name + ':' + entry.level);
+        }
+        return names;
+    }
+
+    // --------------------------------------------------------------- detach
+
+    private void detachInternal() {
+        final Object appender = this.attachedAppender;
+        this.attachedAppender = null;
+        if (appender == null) {
+            return;
+        }
+        final ILoggerFactory factory = LoggerFactory.getILoggerFactory();
+        if (isLogback(factory)) {
+            try {
+                final ClassLoader cl = factory.getClass().getClassLoader();
+                final Class<?> appenderIface = loadClass(cl, LOGBACK_APPENDER_IFACE);
+                final Method getLoggerList = factory.getClass().getMethod("getLoggerList");
+                @SuppressWarnings("unchecked")
+                final Iterable<Object> loggers = (Iterable<Object>) getLoggerList.invoke(factory);
+                for (Object logger : loggers) {
+                    try {
+                        final Method detach = logger.getClass().getMethod("detachAppender", appenderIface);
+                        detach.invoke(logger, appender);
+                    } catch (NoSuchMethodException ignored) {
+                        // older Logback versions use a different method name; ignore.
+                    }
+                }
+            } catch (Exception e) {
+                LOG.debug("Could not cleanly detach Loki appender from Logback loggers", e);
+            }
+        }
+        stopAppender(appender);
+    }
+
+    private static void stopAppender(Object appender) {
+        if (appender == null) {
+            return;
+        }
+        try {
+            appender.getClass().getMethod("stop").invoke(appender);
+        } catch (Exception ignored) {
+            // best-effort
+        }
+    }
+
+    // ------------------------------------------------------------ watchdog
+
+    private void startWatchdog() {
+        stopWatchdog();
         final ScheduledExecutorService exec = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "aem-loki-logback-reload");
+            Thread t = new Thread(r, "aem-loki-watchdog");
             t.setDaemon(true);
             return t;
         });
-        this.reloadExecutor = exec;
-        final AtomicInteger attempt = new AtomicInteger(0);
-        for (long delayMs : RELOAD_DELAYS_MS) {
-            exec.schedule(() -> {
-                int n = attempt.incrementAndGet();
-                boolean ok = triggerLogbackReload(n);
-                if (ok && n >= RELOAD_DELAYS_MS.length) {
-                    shutdownReloadExecutor();
-                }
-            }, delayMs, TimeUnit.MILLISECONDS);
-        }
+        this.watchdog = exec;
+        this.watchdogTask = exec.scheduleAtFixedRate(this::reattachIfNeeded,
+                WATCHDOG_INTERVAL_SECONDS,
+                WATCHDOG_INTERVAL_SECONDS,
+                TimeUnit.SECONDS);
     }
 
-    private void shutdownReloadExecutor() {
-        final ScheduledExecutorService exec = this.reloadExecutor;
-        this.reloadExecutor = null;
+    private void stopWatchdog() {
+        final ScheduledFuture<?> task = this.watchdogTask;
+        this.watchdogTask = null;
+        if (task != null) {
+            task.cancel(false);
+        }
+        final ScheduledExecutorService exec = this.watchdog;
+        this.watchdog = null;
         if (exec != null) {
             exec.shutdownNow();
         }
     }
 
-    private boolean triggerLogbackReload(int attempt) {
-        final BundleContext ctx = this.bundleContext;
-        if (ctx == null) {
-            LOG.debug("Logback reload attempt #{}: bundle context not available", attempt);
-            return false;
+    private void reattachIfNeeded() {
+        synchronized (lock) {
+            final Config config = this.currentConfig;
+            if (config == null) {
+                return;
+            }
+            final Object appender = this.attachedAppender;
+            if (appender != null && isAppenderStillLive(appender)) {
+                return;
+            }
+            LOG.info("Loki appender missing or stopped - re-attaching.");
+            detachInternal();
+            attachInternal(config);
         }
-        ServiceReference<ConfigurationAdmin> ref = null;
+    }
+
+    private boolean isAppenderStillLive(Object appender) {
         try {
-            ref = ctx.getServiceReference(ConfigurationAdmin.class);
-            if (ref == null) {
-                LOG.debug("Logback reload attempt #{}: ConfigurationAdmin service not available", attempt);
+            final Object started = appender.getClass().getMethod("isStarted").invoke(appender);
+            if (!(started instanceof Boolean) || !((Boolean) started)) {
                 return false;
             }
-            final ConfigurationAdmin ca = ctx.getService(ref);
-            if (ca == null) {
-                LOG.debug("Logback reload attempt #{}: ConfigurationAdmin lookup returned null", attempt);
-                return false;
-            }
-            final Configuration cfg = ca.getConfiguration(SLING_LOG_MANAGER_PID, null);
-            final Dictionary<String, Object> current = cfg.getProperties();
-            final Dictionary<String, Object> next = copyProperties(current);
-            next.put(RELOAD_TRIGGER_KEY, String.valueOf(System.currentTimeMillis()));
-            cfg.update(next);
-            LOG.info("Triggered Logback reconfigure via {} (attempt #{})",
-                    SLING_LOG_MANAGER_PID, attempt);
-            return true;
-        } catch (Exception ex) {
-            LOG.warn("Logback reload attempt #{} failed: {}", attempt, ex.toString());
+        } catch (Exception ignored) {
             return false;
-        } finally {
-            if (ref != null) {
+        }
+        try {
+            final ILoggerFactory factory = LoggerFactory.getILoggerFactory();
+            if (!isLogback(factory)) {
+                return false;
+            }
+            final ClassLoader cl = factory.getClass().getClassLoader();
+            final Class<?> appenderIface = loadClass(cl, LOGBACK_APPENDER_IFACE);
+            final Method getLoggerList = factory.getClass().getMethod("getLoggerList");
+            @SuppressWarnings("unchecked")
+            final Iterable<Object> loggers = (Iterable<Object>) getLoggerList.invoke(factory);
+            for (Object logger : loggers) {
                 try {
-                    ctx.ungetService(ref);
-                } catch (IllegalStateException ignored) {
-                    // bundle context might be gone during shutdown
+                    final Method getAppender = logger.getClass().getMethod("getAppender", String.class);
+                    final Object existing = getAppender.invoke(logger, APPENDER_NAME);
+                    if (existing == appender) {
+                        return true;
+                    }
+                } catch (NoSuchMethodException ignored) {
+                    // ignore and continue
+                }
+                // also check via iteration if possible
+                try {
+                    final Method iter = logger.getClass().getMethod("iteratorForAppenders");
+                    final java.util.Iterator<?> it = (java.util.Iterator<?>) iter.invoke(logger);
+                    while (it.hasNext()) {
+                        if (it.next() == appender) {
+                            return true;
+                        }
+                    }
+                } catch (NoSuchMethodException ignored) {
+                    // ignore
                 }
             }
+        } catch (Exception e) {
+            LOG.debug("Watchdog couldn't verify Loki appender attachment state", e);
+            return false;
         }
+        return false;
     }
 
-    private static Dictionary<String, Object> copyProperties(Dictionary<String, Object> src) {
-        final Dictionary<String, Object> out = new Hashtable<>();
-        if (src != null) {
-            final java.util.Enumeration<String> keys = src.keys();
-            while (keys.hasMoreElements()) {
-                final String k = keys.nextElement();
-                final Object v = src.get(k);
-                if (v != null) {
-                    out.put(k, v);
-                }
+    // ----------------------------------------------------------- reflection
+
+    private static boolean isLogback(ILoggerFactory factory) {
+        if (factory == null) {
+            return false;
+        }
+        // Walk the class hierarchy so we also accept anonymous Logback
+        // subclasses or vendor-specific wrappers.
+        for (Class<?> c = factory.getClass(); c != null; c = c.getSuperclass()) {
+            if (LOGBACK_LOGGER_CONTEXT_CLASS.equals(c.getName())) {
+                return true;
             }
         }
-        return out;
+        return false;
     }
 
-    // ----------------------------------------------------------------- render
-
-    private static String renderFragment(Config config) {
-        final String url = trimToEmpty(config.url());
-        if (url.isEmpty()) {
-            LOG.warn("Loki push URL is empty - no appender will be registered");
-            return EMPTY_FRAGMENT;
-        }
-
-        final String labelPattern = buildLabelPattern(config.labels());
-        final String messagePattern = firstNonBlank(config.messagePattern(), DEFAULT_MESSAGE_PATTERN);
-        final List<LoggerEntry> loggers = parseLoggers(config.loggers());
-
-        final StringBuilder xml = new StringBuilder(1024);
-        xml.append("<included>\n");
-
-        xml.append("  <appender name=\"").append(APPENDER_NAME)
-                .append("\" class=\"com.github.loki4j.logback.Loki4jAppender\">\n");
-        xml.append("    <batchMaxItems>").append(config.batchMaxItems()).append("</batchMaxItems>\n");
-        xml.append("    <batchTimeoutMs>").append(config.batchTimeoutMs()).append("</batchTimeoutMs>\n");
-        if (config.sendQueueMaxBytes() > 0L) {
-            xml.append("    <sendQueueMaxBytes>").append(config.sendQueueMaxBytes()).append("</sendQueueMaxBytes>\n");
-        }
-        if (config.verbose()) {
-            xml.append("    <verbose>true</verbose>\n");
-        }
-
-        xml.append("    <http>\n");
-        xml.append("      <url>").append(escapeXml(url)).append("</url>\n");
-        final String username = trimToEmpty(config.username());
-        final String password = trimToEmpty(config.password());
-        if (!username.isEmpty() || !password.isEmpty()) {
-            xml.append("      <auth>\n");
-            xml.append("        <username>").append(escapeXml(username)).append("</username>\n");
-            xml.append("        <password>").append(escapeXml(password)).append("</password>\n");
-            xml.append("      </auth>\n");
-        }
-        xml.append("    </http>\n");
-
-        xml.append("    <format>\n");
-        xml.append("      <label>\n");
-        xml.append("        <pattern>").append(escapeXml(labelPattern)).append("</pattern>\n");
-        xml.append("      </label>\n");
-        xml.append("      <message>\n");
-        xml.append("        <pattern>").append(escapeXml(messagePattern)).append("</pattern>\n");
-        xml.append("      </message>\n");
-        xml.append("    </format>\n");
-        xml.append("  </appender>\n");
-
-        for (LoggerEntry logger : loggers) {
-            xml.append("  <logger name=\"").append(escapeXml(logger.name))
-                    .append("\" level=\"").append(escapeXml(logger.level))
-                    .append("\" additivity=\"").append(logger.additivity).append("\">\n");
-            xml.append("    <appender-ref ref=\"").append(APPENDER_NAME).append("\"/>\n");
-            xml.append("  </logger>\n");
-        }
-
-        xml.append("</included>\n");
-        return xml.toString();
+    private static Class<?> loadClass(ClassLoader cl, String name) throws ClassNotFoundException {
+        return Class.forName(name, true, cl);
     }
+
+    private static void invoke(Object target, String method) throws Exception {
+        target.getClass().getMethod(method).invoke(target);
+    }
+
+    private static void invoke(Object target, String method, Object arg, Class<?> paramType) throws Exception {
+        target.getClass().getMethod(method, paramType).invoke(target, arg);
+    }
+
+    private static void invokeSetter(Object target, String method, Object value, Class<?> paramType) throws Exception {
+        Method m;
+        try {
+            m = target.getClass().getMethod(method, paramType);
+        } catch (NoSuchMethodException nsme) {
+            // Try to find a compatible single-arg setter by walking the hierarchy.
+            m = findCompatibleSetter(target.getClass(), method, value);
+            if (m == null) {
+                throw nsme;
+            }
+        }
+        m.invoke(target, value);
+    }
+
+    private static Method findCompatibleSetter(Class<?> cls, String name, Object value) {
+        for (Method m : cls.getMethods()) {
+            if (!name.equals(m.getName()) || m.getParameterCount() != 1) {
+                continue;
+            }
+            final Class<?> p = m.getParameterTypes()[0];
+            if (value == null || p.isInstance(value)) {
+                return m;
+            }
+        }
+        return null;
+    }
+
+    // --------------------------------------------------------- config utils
 
     private static String buildLabelPattern(String[] labels) {
         if (labels == null || labels.length == 0) {
@@ -368,36 +582,6 @@ public class LogbackLokiBootstrap implements ConfigProvider {
         return t.isEmpty() ? fallback : preferred;
     }
 
-    private static String escapeXml(String value) {
-        if (value == null || value.isEmpty()) {
-            return "";
-        }
-        final StringBuilder out = new StringBuilder(value.length() + 16);
-        for (int i = 0; i < value.length(); i++) {
-            final char c = value.charAt(i);
-            switch (c) {
-                case '&':
-                    out.append("&amp;");
-                    break;
-                case '<':
-                    out.append("&lt;");
-                    break;
-                case '>':
-                    out.append("&gt;");
-                    break;
-                case '"':
-                    out.append("&quot;");
-                    break;
-                case '\'':
-                    out.append("&apos;");
-                    break;
-                default:
-                    out.append(c);
-            }
-        }
-        return out.toString();
-    }
-
     private static final class LoggerEntry {
         final String name;
         final String level;
@@ -412,7 +596,7 @@ public class LogbackLokiBootstrap implements ConfigProvider {
 
     @ObjectClassDefinition(
             name = "AEM | Loki Integrator - Logback bootstrap",
-            description = "Registers a Loki (loki4j) appender with the AEM Logback runtime. "
+            description = "Attaches a Loki (loki4j) appender to AEM's Logback LoggerContext. "
                     + "All appender and logger settings are read from this configuration.")
     public @interface Config {
 

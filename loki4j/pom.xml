@@ -75,21 +75,38 @@ Fragment-Host: org.apache.sling.commons.log
 # bundle wiring consistent and because AEMaaCS Code Quality (rule S1874)
 # treats any ch.qos.logback.* Import-Package header as a vulnerability.
 Export-Package: com.github.loki4j.logback,\
+ com.github.loki4j.client.*,\
  com.github.loki4j.pkg.*,\
  com.github.loki4j.util.*
+
+# Rules for Import-Package:
+#  * !ch.qos.logback.*  -> never advertise Logback as an import (S1874); the
+#                          fragment host already carries those classes.
+#  * !com.github.loki4j.*-> never import our own packages (they are exported
+#                          by this same fragment; a non-optional self-import
+#                          prevents the fragment from resolving on AEMaaCS).
+#  * Everything else is marked resolution:=optional via the final catch-all
+#    so that the fragment always attaches to the Sling log host, even if
+#    HTTP/snappy/micrometer/protobuf aren't exported by the framework. The
+#    Loki4j runtime only needs `java.net.http` (a JDK package, always
+#    present on AEM's JDK 11) to function; anything else is a best-effort
+#    extra that should not block fragment attachment.
 Import-Package: !ch.qos.logback.*,\
- org.xerial.snappy;resolution:=optional,\
- io.micrometer.core.instrument.*;resolution:=optional,\
- com.google.protobuf;resolution:=optional,\
- com.github.loki4j.pkg.google.protobuf;resolution:=optional,\
- com.github.loki4j.pkg.loki.protobuf;resolution:=optional,\
- *
+ !com.github.loki4j.*,\
+ org.slf4j,\
+ org.slf4j.helpers,\
+ org.slf4j.spi,\
+ *;resolution:=optional
 
 # Keep the manifest free of 'uses:="ch.qos.logback..."' clauses that bnd
 # would otherwise generate on Export-Package entries. No downstream bundle
 # imports these exports from us (they go through the host), so a uses
 # constraint is not needed and the ch.qos.logback.* tokens trip S1874.
 -nouses: true
+
+# Expose no capabilities/services from a fragment - it's only a carrier
+# for the Loki4j classes attached to the Sling log host.
+Bundle-ActivationPolicy: lazy
 
 Embed-Dependency: loki-logback-appender;scope=compile|runtime
 -includeresource: @loki-logback-appender-${loki4j.version}.jar

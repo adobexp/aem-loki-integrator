@@ -13,10 +13,11 @@
     <packaging>jar</packaging>
     <name>AEM Loki Integrator - Core Bundle</name>
     <description>
-        OSGi bundle that registers a Logback ConfigProvider service. The
-        provider builds the Loki (loki4j) appender XML fragment from a single
-        OSGi configuration and hands it to the AEM Logback runtime through
-        Apache Sling Commons Log.
+        OSGi bundle that attaches the Loki (loki4j) appender to AEM's Logback
+        LoggerContext programmatically via SLF4J + reflection. The bundle
+        has no compile-time dependency on Logback internals, so AEMaaCS
+        Code Quality rule S1874 has nothing to flag. All appender and
+        logger settings come from a single OSGi configuration.
     </description>
 
     <build>
@@ -35,7 +36,16 @@
 Bundle-SymbolicName: ${project.artifactId}
 Bundle-Name: ${project.name}
 Bundle-Version: ${project.version}
-Import-Package: org.apache.sling.commons.log.logback;resolution:=optional,*
+
+# This bundle uses ONLY SLF4J + reflection to talk to Logback. We must not
+# advertise any ch.qos.logback.* or org.apache.sling.commons.log.logback
+# package in Import-Package, both because we have no compile-time dependency
+# on them and because AEMaaCS Code Quality rule S1874 flags those headers
+# as a vulnerability.
+Import-Package: !ch.qos.logback.*,\
+ !org.apache.sling.commons.log.logback.*,\
+ !com.github.loki4j.*,\
+ *
 ]]></bnd>
                         </configuration>
                     </execution>
@@ -62,13 +72,6 @@ Import-Package: org.apache.sling.commons.log.logback;resolution:=optional,*
         <dependency>
             <groupId>com.adobe.aem</groupId>
             <artifactId>aem-sdk-api</artifactId>
-        </dependency>
-
-        <!-- Apache Sling Commons Log is supplied by AEM at runtime; we only
-             need ConfigProvider at compile time. -->
-        <dependency>
-            <groupId>org.apache.sling</groupId>
-            <artifactId>org.apache.sling.commons.log</artifactId>
         </dependency>
     </dependencies>
 </project>
