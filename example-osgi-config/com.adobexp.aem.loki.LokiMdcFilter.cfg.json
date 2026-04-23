@@ -1,0 +1,15 @@
+{
+  "enabled:Boolean": true,
+
+  "userIdKey": "userID",
+  "hashUserId:Boolean": false,
+  "skipAnonymous:Boolean": false,
+
+  "sessionIdKey": "sessionID",
+  "sessionIdSource": "http",
+
+  "requestIdKey": "requestID",
+
+  "resourcePathKey": "resourcePath",
+  "resourcePathMaxLength:Integer": 256
+}

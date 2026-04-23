@@ -16,7 +16,7 @@
   "sendQueueMaxBytes:Long": 0,
   "verbose:Boolean": false,
 
-  "messagePattern": "*%level* [%thread] %logger{100} | %msg %ex",
+  "messagePattern": "*%level* [%thread] [%X{userID}|%X{sessionID}|%X{requestID}] %logger{100} | %msg%n%ex",
 
   "facadeEnabled:Boolean": true,
   "tailerEnabled:Boolean": false,
