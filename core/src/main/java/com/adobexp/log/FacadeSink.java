@@ -11,12 +11,42 @@ package com.adobexp.log;
  * every facade call still reaches SLF4J exactly as it would have
  * without the facade, but nothing is tee'd to Loki.
  *
+ * <p><b>Filter independence (since 3.2.0).</b> Starting with the
+ * decoupled-filtering contract, the facade adapter no longer consults
+ * SLF4J's {@code isXxxEnabled()} to decide whether to tee an event.
+ * Each call is always offered to the currently registered sink, which
+ * is free to accept or reject it via {@link #accepts(String, Level)}.
+ * This means the filter that controls what reaches Loki is completely
+ * independent of the Sling {@code LogManager} configuration that
+ * controls what reaches {@code aemerror.log}. A team can legitimately
+ * run {@code error.log} at {@code WARN} while shipping {@code DEBUG}
+ * from the same loggers to Loki.
+ *
  * <p>Implementations MUST be non-blocking and exception-safe: the sink
  * runs on the caller's thread (typically an HTTP worker or a scheduled
  * job) and must not throw or block to avoid degrading the application.
  */
 @FunctionalInterface
 public interface FacadeSink {
+
+    /**
+     * Cheap, side-effect-free filter check. Called by the facade
+     * adapter before formatting a parameterized log message so that
+     * discarded events cost almost nothing. A sink with its own
+     * per-logger / per-level filter SHOULD override this method; the
+     * default implementation accepts everything, which preserves the
+     * pre-3.2.0 "tee and let the sink decide later" contract for
+     * backwards compatibility with third-party sinks.
+     *
+     * @param loggerName fully-qualified logger name
+     * @param level      severity of the event
+     * @return {@code true} if the sink would accept this event, in
+     *         which case the adapter will format the message and call
+     *         {@link #accept(String, Level, String, Throwable)}
+     */
+    default boolean accepts(String loggerName, Level level) {
+        return true;
+    }
 
     /**
      * Handed a fully-rendered message. The facade has already performed

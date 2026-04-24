@@ -73,6 +73,18 @@ import org.slf4j.MDC;
  * {@code tailerEnabled} flags are optional and default to sensible
  * values for a fresh install.
  *
+ * <p><b>Independent filtering (since 3.2.0).</b> What reaches Loki is
+ * driven exclusively by the {@code loggers} OSGi property on this
+ * component (e.g. {@code "com.pg:DEBUG"},
+ * {@code "com.publicisgroupe.aem:DEBUG"}) via
+ * {@link com.adobexp.aem.loki.LoggerFilter}. It is no longer coupled
+ * to the Sling {@code LogManager} factory configs that control
+ * {@code aemerror.log}. A team can therefore pin
+ * {@code aemerror.log} at {@code WARN} (cheap disk / dispatcher cost)
+ * while shipping {@code DEBUG} from the same logger tree to Loki for
+ * observability. See {@link com.adobexp.log.FacadeSink} javadoc for
+ * the full rationale.
+ *
  * <p>Internally this class is deliberately kept as just the OSGi
  * component shell: activation, deactivation, event ingestion, batch
  * flush and HTTP push. All the building blocks it relies on live in
@@ -326,6 +338,26 @@ public class LogbackLokiBootstrap {
      * on the forwarder's scheduler thread during {@link #flush()}.
      */
     private final class BootstrapFacadeSink implements com.adobexp.log.FacadeSink {
+
+        /**
+         * Cheap first-pass filter. Consults the bundle's own
+         * {@link #loggerFilters} (parsed from the {@code loggers}
+         * OSGi property) so that events destined to be dropped never
+         * reach {@link #accept} and therefore never incur message
+         * formatting, MDC capture, or {@link ParsedEntry} allocation.
+         * This is the method that decouples Loki visibility from
+         * Sling's {@code LogManager} configuration: callers get to
+         * ship DEBUG-level events for {@code com.pg.*} to Loki even
+         * when {@code aemerror.log} is pinned at WARN by Sling.
+         */
+        @Override
+        public boolean accepts(String loggerName, com.adobexp.log.Level level) {
+            if (loggerName == null || loggerName.startsWith(SELF_LOGGER_PREFIX)) {
+                return false;
+            }
+            return matchesAnyFilter(loggerName, toAemLevel(level));
+        }
+
         @Override
         public void accept(String loggerName, com.adobexp.log.Level level,
                            String message, Throwable throwable) {
